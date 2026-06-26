@@ -54,18 +54,20 @@ pip install -r requirements.txt
 ```
 Servicios externos que deben estar corriendo:
 - PostgreSQL (base `analytics`, puerto 5432).
-- Redis (puerto 6379) — pendiente de levantar; ver "Estado actual".
+- Redis (puerto 6379) — corriendo en WSL (Ubuntu). Arrancar con
+  `sudo service redis-server start`; verificar con `redis-cli ping` → PONG.
 ```
 
 ## Arquitectura del código
 
 ```
 app/
-  config.py    — Lee DATABASE_URL (y futuras vars) desde .env vía pydantic-settings.
+  config.py    — Lee DATABASE_URL, REDIS_HOST y REDIS_PORT desde .env vía pydantic-settings.
   database.py  — Crea el engine SQLAlchemy, SessionLocal y la clase Base para los modelos.
   models.py    — Modelo ORM Event; define la tabla `events` con sus columnas e índices.
   schemas.py   — Schema Pydantic EventCreate; valida el body JSON que llega al endpoint.
-  main.py      — App FastAPI: GET /health y POST /events (escribe directo a DB por ahora).
+  queue.py     — Crea el cliente Redis vía get_redis(); redis-py maneja el pool interno.
+  main.py      — App FastAPI: GET /health y POST /events (encola en Redis con lpush, devuelve 202).
 
 alembic/
   env.py       — Configura Alembic para usar settings.database_url y detectar Base.metadata.
@@ -74,9 +76,7 @@ alembic/
 test_db.py     — Script one-shot para verificar conectividad con la DB (no es suite de tests).
 ```
 
-El flujo actual de un evento: `POST /events` → validación Pydantic → `Event()` ORM → `db.commit()` → PostgreSQL.
-
-El flujo objetivo (etapa 3): `POST /events` → validación Pydantic → `redis.lpush()` → respuesta 202 → worker consume → `db.commit()` → PostgreSQL.
+El flujo actual (etapa 3 en curso): `POST /events` → validación Pydantic → `redis.lpush("events_queue")` → respuesta 202 → [worker pendiente] → `db.commit()` → PostgreSQL.
 
 ## Roadmap del proyecto (Plataforma de analítica en tiempo real)
 
@@ -101,25 +101,30 @@ Decisiones de diseño ya tomadas (y su porqué):
   (event_name, user_id, timestamp) como columnas indexadas.
 - SQLAlchemy SÍNCRONO a propósito: los workers (síncronos) serán los que
   escriban; el endpoint usa `def` (no async) para no bloquear el event loop.
+- Cliente Redis creado por llamada en get_redis(): redis-py maneja un pool
+  interno, así que no hace falta un singleton en este caso síncrono.
+- POST /events responde 202 Accepted: la ingesta es asíncrona; el evento se
+  acepta pero se procesa después (lo persiste el worker, no el endpoint).
+- Cola FIFO con Redis: el endpoint empuja con lpush (izquierda) y el worker
+  sacará con rpop/brpop (derecha) → el evento más viejo se procesa primero.
 - Configuración por variables de entorno; secretos en .env (en .gitignore).
+  redis_host/redis_port llevan defaults (localhost/6379) por ser estándar;
+  database_url NO lleva default a propósito (es secreto y debe fallar si falta).
 
 ## Estado actual (retomar aquí)
-Etapa 3 en curso. Avance y bloqueo:
-- Ya se discutió el diseño del cliente Redis (módulo `app/queue.py` con una
-  función `get_redis()`; se decidió crear el cliente por llamada porque
-  redis-py ya maneja un pool de conexiones interno; un singleton no aporta
-  en este caso síncrono).
-- BLOQUEO: falta levantar Redis. Docker Desktop NO se pudo instalar (versión
-  de Windows incompatible: pide 22H2 / build 19045 o superior).
-- Opciones para desbloquear, en orden de preferencia:
-  A) Actualizar Windows a 22H2 desde Windows Update, luego reintentar Docker.
-  B) Instalar Redis directo en WSL (`wsl --install` → Ubuntu →
-     `sudo apt install redis-server` → `sudo service redis-server start`).
-     Conectar desde la API en localhost:6379. ← opción recomendada.
-  C) Redis en la nube (Redis Cloud / Upstash); URL en .env. Red de seguridad.
-- PENDIENTE tras desbloquear: escribir `app/queue.py`, verificar con
-  `get_redis().ping()` → True, y luego refactorizar `POST /events` para que
-  encole en vez de escribir directo a la DB.
+Etapa 3 en curso. Avance:
+- Redis corriendo en WSL (Ubuntu). Verificado con `redis-cli ping` → PONG.
+- app/queue.py escrito y verificado: `get_redis().ping()` → True.
+- config.py: agregados redis_host (default localhost) y redis_port (default 6379).
+- POST /events refactorizado: ya NO escribe a DB; encola en Redis con
+  lpush("events_queue") y devuelve 202. Ya no recibe db: Session.
+- requirements.txt actualizado con redis.
+
+PENDIENTE INMEDIATO:
+- Probar el endpoint (Swagger /docs) y verificar el encolado con
+  `redis-cli lrange events_queue 0 -1` (ver el evento como JSON en la cola).
+- Escribir el worker: consume con rpop/brpop, deserializa el JSON,
+  reconstruye el Event ORM y escribe a PostgreSQL (db.commit()).
 
 ## Limpieza pendiente
 - El proyecto quedó anidado (analytics-realtime/analytics-realtime). Trabajar
