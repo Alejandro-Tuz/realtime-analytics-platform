@@ -32,6 +32,11 @@ Levantar el servidor de desarrollo:
 uvicorn app.main:app --reload
 ```
 
+Levantar el worker (en otra terminal, con el venv activo y Redis corriendo):
+```
+python worker.py
+```
+
 Verificar la conexión a la base de datos:
 ```
 python test_db.py
@@ -69,6 +74,8 @@ app/
   queue.py     — Crea el cliente Redis vía get_redis(); redis-py maneja el pool interno.
   main.py      — App FastAPI: GET /health y POST /events (encola en Redis con lpush, devuelve 202).
 
+worker.py      — Proceso aparte (NO es la API). Consume events_queue con brpop, deserializa
+                 el JSON, reconstruye el Event ORM y lo guarda en PostgreSQL. Se corre solo.
 alembic/
   env.py       — Configura Alembic para usar settings.database_url y detectar Base.metadata.
   versions/    — Migraciones versionadas; la primera crea la tabla events con sus índices.
@@ -76,7 +83,7 @@ alembic/
 test_db.py     — Script one-shot para verificar conectividad con la DB (no es suite de tests).
 ```
 
-El flujo actual (etapa 3 en curso): `POST /events` → validación Pydantic → `redis.lpush("events_queue")` → respuesta 202 → [worker pendiente] → `db.commit()` → PostgreSQL.
+El flujo actual (etapa 3): `POST /events` → validación Pydantic → `redis.lpush("events_queue")` → respuesta 202 → `worker.py` consume con `brpop` → reconstruye Event ORM → `db.commit()` → PostgreSQL.
 
 ## Roadmap del proyecto (Plataforma de analítica en tiempo real)
 
@@ -99,32 +106,47 @@ Decisiones de diseño ya tomadas (y su porqué):
   reproducible con `alembic upgrade head`.
 - `properties` como JSONB: datos flexibles por tipo de evento; campos fijos
   (event_name, user_id, timestamp) como columnas indexadas.
-- SQLAlchemy SÍNCRONO a propósito: los workers (síncronos) serán los que
-  escriban; el endpoint usa `def` (no async) para no bloquear el event loop.
+- SQLAlchemy SÍNCRONO a propósito: los workers (síncronos) son los que
+  escriben; el endpoint usa `def` (no async) para no bloquear el event loop.
 - Cliente Redis creado por llamada en get_redis(): redis-py maneja un pool
   interno, así que no hace falta un singleton en este caso síncrono.
 - POST /events responde 202 Accepted: la ingesta es asíncrona; el evento se
   acepta pero se procesa después (lo persiste el worker, no el endpoint).
 - Cola FIFO con Redis: el endpoint empuja con lpush (izquierda) y el worker
-  sacará con rpop/brpop (derecha) → el evento más viejo se procesa primero.
+  saca con brpop (derecha) → el evento más viejo se procesa primero.
+- Worker usa brpop (no rpop): bloquea/duerme cuando la cola está vacía en vez
+  de quemar CPU en espera activa. timeout=5 permite atender Ctrl+C limpiamente.
+- Worker maneja la sesión a mano (SessionLocal + try/finally) porque no hay
+  FastAPI que gestione el ciclo de vida con Depends(get_db).
+- worker.py va en la raíz (no en app/): es un proceso hermano, no parte de la API.
 - Configuración por variables de entorno; secretos en .env (en .gitignore).
   redis_host/redis_port llevan defaults (localhost/6379) por ser estándar;
   database_url NO lleva default a propósito (es secreto y debe fallar si falta).
 
 ## Estado actual (retomar aquí)
-Etapa 3 en curso. Avance:
+Etapa 3 casi cerrada. Avance:
 - Redis corriendo en WSL (Ubuntu). Verificado con `redis-cli ping` → PONG.
 - app/queue.py escrito y verificado: `get_redis().ping()` → True.
 - config.py: agregados redis_host (default localhost) y redis_port (default 6379).
 - POST /events refactorizado: ya NO escribe a DB; encola en Redis con
   lpush("events_queue") y devuelve 202. Ya no recibe db: Session.
+- Probado el encolado en Swagger: eventos se acumulan en events_queue
+  (verificado con `redis-cli lrange events_queue 0 -1`). Aún NO llegan a la
+  tabla `events` porque falta el worker que los mueva.
 - requirements.txt actualizado con redis.
+- worker.py: DISEÑADO Y ENTENDIDO a fondo, pero AÚN NO escrito ni probado.
 
-PENDIENTE INMEDIATO:
-- Probar el endpoint (Swagger /docs) y verificar el encolado con
-  `redis-cli lrange events_queue 0 -1` (ver el evento como JSON en la cola).
-- Escribir el worker: consume con rpop/brpop, deserializa el JSON,
-  reconstruye el Event ORM y escribe a PostgreSQL (db.commit()).
+PENDIENTE INMEDIATO (mañana):
+- Escribir worker.py en la raíz del proyecto. Estructura:
+  * save_event(payload): abre SessionLocal, construye Event ORM, db.add + commit,
+    cierra con try/finally. OJO: el timestamp llega como string ISO, hay que
+    reconvertirlo con datetime.fromisoformat(payload["timestamp"]).
+  * run(): bucle while True con r.brpop("events_queue", timeout=5); si None,
+    continue; si no, desempaca _, raw = result; json.loads(raw); save_event(...).
+  * if __name__ == "__main__": run().
+- Probar con DOS terminales (API + worker), mandar POST /events, ver
+  "Procesado: ..." en el worker y confirmar la fila con SELECT * FROM events;
+- Confirmar que la cola se vacía a medida que el worker procesa.
 
 ## Limpieza pendiente
 - El proyecto quedó anidado (analytics-realtime/analytics-realtime). Trabajar
