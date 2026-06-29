@@ -72,6 +72,8 @@ app/
   models.py    — Modelo ORM Event; define la tabla `events` con sus columnas e índices.
   schemas.py   — Schema Pydantic EventCreate; valida el body JSON que llega al endpoint.
   queue.py     — Crea el cliente Redis vía get_redis(); redis-py maneja el pool interno.
+  metrics.py   — Consultas SQL agregadas con el ORM. get_summary(): total de eventos,
+                 usuarios únicos (distinct) y conteo por tipo (group by + order by).
   main.py      — App FastAPI: GET /health y POST /events (encola en Redis con lpush, devuelve 202).
 
 worker.py      — Proceso aparte (NO es la API). Consume events_queue con brpop, deserializa
@@ -83,7 +85,7 @@ alembic/
 test_db.py     — Script one-shot para verificar conectividad con la DB (no es suite de tests).
 ```
 
-El flujo actual (etapa 3): `POST /events` → validación Pydantic → `redis.lpush("events_queue")` → respuesta 202 → `worker.py` consume con `brpop` → reconstruye Event ORM → `db.commit()` → PostgreSQL.
+El flujo completo (etapa 3 lista): `POST /events` → validación Pydantic → `redis.lpush("events_queue")` → respuesta 202 → `worker.py` consume con `brpop` → deserializa JSON → reconstruye Event ORM → `db.commit()` → PostgreSQL.
 
 ## Roadmap del proyecto (Plataforma de analítica en tiempo real)
 
@@ -96,10 +98,32 @@ Cliente → API (FastAPI) → Cola (Redis) → Workers → PostgreSQL → Dashbo
 Etapas:
 1. [HECHO] API recibe y valida eventos (FastAPI + Pydantic).
 2. [HECHO] Persistencia en PostgreSQL (SQLAlchemy + Alembic, code-first).
-3. [EN CURSO] Redis + workers: la API encola eventos en vez de escribir
+3. [HECHO] Redis + workers: la API encola eventos en vez de escribir
    directo; los workers consumen la cola y guardan en PostgreSQL.
-4. [PENDIENTE] Endpoints de métricas + dashboard en vivo por WebSocket.
+4. [EN CURSO] Endpoints de métricas + dashboard en vivo por WebSocket.
 5. [PENDIENTE] Empaquetado con Docker y despliegue (Render/Railway/Fly.io).
+
+## Plan de la etapa 4 (EN CURSO) — métricas + dashboard en vivo
+Cuatro piezas, en este orden:
+- 4.1 [HECHO] app/metrics.py — funciones de consulta SQL agregado (get_summary()).
+- 4.2 [PENDIENTE] Endpoints REST de métricas en app/main.py — exponen get_summary()
+      por HTTP con un GET (p. ej. GET /metrics/summary).
+- 4.3 [PENDIENTE] Endpoint WebSocket en app/main.py — conexión abierta que empuja
+      las métricas al dashboard en vivo (cada pocos segundos), sin recargar.
+- 4.4 [PENDIENTE] Dashboard HTML en app/static/index.html — la página que muestra
+      las métricas y se conecta al WebSocket.
+
+Concepto clave de la etapa (importa para la pieza 4.3):
+- Un endpoint WebSocket OBLIGA a usar `async def`: mantiene la conexión abierta
+  mucho tiempo, y eso lo maneja bien el modelo asíncrono (el event loop).
+- PERO SQLAlchemy es síncrono/bloqueante. Si se llama directo dentro de un
+  `async def`, bloquea el event loop y nadie más puede conectarse mientras
+  corre la query.
+- Solución: `resultado = await asyncio.to_thread(funcion_sincrona, args)`.
+  Manda la función síncrona a un thread aparte y deja el event loop libre.
+  Es el puente entre el mundo sync (SQLAlchemy) y el async (WebSocket).
+- Frase de entrevista: "Usé asyncio.to_thread para correr las queries síncronas
+  de SQLAlchemy desde el handler async del WebSocket sin bloquear el event loop."
 
 Decisiones de diseño ya tomadas (y su porqué):
 - Code-first con ORM y migraciones: el esquema vive en código y en git,
@@ -118,35 +142,34 @@ Decisiones de diseño ya tomadas (y su porqué):
   de quemar CPU en espera activa. timeout=5 permite atender Ctrl+C limpiamente.
 - Worker maneja la sesión a mano (SessionLocal + try/finally) porque no hay
   FastAPI que gestione el ciclo de vida con Depends(get_db).
+- Worker envuelve brpop en try/except redis.exceptions.TimeoutError: en el
+  puente de red Windows→WSL, el timeout del socket puede dispararse justo antes
+  de que Redis responda (condición de carrera). Se trata como "cola vacía"
+  (continue). Lección: en producción los workers SIEMPRE manejan errores de red.
 - worker.py va en la raíz (no en app/): es un proceso hermano, no parte de la API.
+- metrics.py usa el patrón SessionLocal + try/finally (igual que el worker),
+  no Depends(get_db), porque las consultas pueden llamarse fuera de un request.
 - Configuración por variables de entorno; secretos en .env (en .gitignore).
   redis_host/redis_port llevan defaults (localhost/6379) por ser estándar;
   database_url NO lleva default a propósito (es secreto y debe fallar si falta).
 
 ## Estado actual (retomar aquí)
-Etapa 3 casi cerrada. Avance:
-- Redis corriendo en WSL (Ubuntu). Verificado con `redis-cli ping` → PONG.
-- app/queue.py escrito y verificado: `get_redis().ping()` → True.
-- config.py: agregados redis_host (default localhost) y redis_port (default 6379).
-- POST /events refactorizado: ya NO escribe a DB; encola en Redis con
-  lpush("events_queue") y devuelve 202. Ya no recibe db: Session.
-- Probado el encolado en Swagger: eventos se acumulan en events_queue
-  (verificado con `redis-cli lrange events_queue 0 -1`). Aún NO llegan a la
-  tabla `events` porque falta el worker que los mueva.
-- requirements.txt actualizado con redis.
-- worker.py: DISEÑADO Y ENTENDIDO a fondo, pero AÚN NO escrito ni probado.
+Etapa 4 en curso. Pieza 4.1 HECHA y probada:
+- app/metrics.py escrito con get_summary() → devuelve un dict con
+  {total_events, unique_users, events_by_type}.
+  * total_events: func.count(Event.id)
+  * unique_users: func.count(func.distinct(Event.user_id))
+  * events_by_type: group_by(event_name) + order_by(count desc), pasado a dict.
+- Probado en python interactivo:
+  `from app.metrics import get_summary; print(get_summary())` → muestra los
+  conteos reales desde PostgreSQL (los eventos guardados por el worker).
+- Nota: el import `text` en metrics.py está puesto pero AÚN no se usa; lo
+  reservó para una posible query de métricas por rango de tiempo. No es error.
 
-PENDIENTE INMEDIATO (mañana):
-- Escribir worker.py en la raíz del proyecto. Estructura:
-  * save_event(payload): abre SessionLocal, construye Event ORM, db.add + commit,
-    cierra con try/finally. OJO: el timestamp llega como string ISO, hay que
-    reconvertirlo con datetime.fromisoformat(payload["timestamp"]).
-  * run(): bucle while True con r.brpop("events_queue", timeout=5); si None,
-    continue; si no, desempaca _, raw = result; json.loads(raw); save_event(...).
-  * if __name__ == "__main__": run().
-- Probar con DOS terminales (API + worker), mandar POST /events, ver
-  "Procesado: ..." en el worker y confirmar la fila con SELECT * FROM events;
-- Confirmar que la cola se vacía a medida que el worker procesa.
+SIGUIENTE (retomar aquí con Claude Code):
+- Pieza 4.2: crear los endpoints REST de métricas en app/main.py que exponen
+  get_summary() por HTTP (un GET, p. ej. GET /metrics/summary). Probar en /docs.
+- Luego 4.3 (WebSocket, recordar asyncio.to_thread) y 4.4 (dashboard HTML).
 
 ## Limpieza pendiente
 - El proyecto quedó anidado (analytics-realtime/analytics-realtime). Trabajar
