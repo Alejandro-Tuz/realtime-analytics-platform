@@ -2,12 +2,14 @@ import asyncio
 import json
 
 from fastapi import FastAPI, WebSocket
+from fastapi.staticfiles import StaticFiles
 
 from app.schemas import EventCreate
 from app.queue import get_redis
 from app.metrics import get_summary
 
 app = FastAPI(title="Analytics en tiempo real")
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 
 @app.get("/health")

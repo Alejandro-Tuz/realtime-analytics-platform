@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <title>Dashboard Analytics</title>
+</head>
+<body>
+  <h1>Métricas en vivo</h1>
+
+  <p>Total de eventos: <strong id="total"></strong></p>
+  <p>Usuarios únicos: <strong id="users"></strong></p>
+  <p>Eventos por tipo: <strong id="by-type"></strong></p>
+
+  <script>
+    const ws = new WebSocket("ws://localhost:8000/ws/metrics");
+
+    ws.onmessage = function(e) {
+      const data = JSON.parse(e.data);
+      document.getElementById("total").textContent = data.total_events;
+      document.getElementById("users").textContent = data.unique_users;
+      document.getElementById("by-type").textContent = JSON.stringify(data.events_by_type);
+    };
+  </script>
+</body>
+</html> 
