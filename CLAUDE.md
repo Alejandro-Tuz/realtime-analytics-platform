@@ -76,6 +76,12 @@ app/
                  usuarios únicos (distinct) y conteo por tipo (group by + order by).
   main.py      — App FastAPI. Endpoints: GET /health, POST /events (encola en Redis, 202),
                  GET /metrics/summary (métricas), WS /ws/metrics (métricas en vivo).
+                 Monta StaticFiles en /static para servir el dashboard.
+  static/
+    index.html — Dashboard en vivo (HTML/CSS/JS puro, sin frameworks). Se conecta al
+                 WebSocket, muestra total/usuarios únicos/eventos por tipo con barras,
+                 destella los números al cambiar, indicador de conexión y auto-reconexión.
+                 La URL del WS se deriva de location.host (sirve en local y en prod).
 
 worker.py      — Proceso aparte (NO es la API). Consume events_queue con brpop, deserializa
                  el JSON, reconstruye el Event ORM y lo guarda en PostgreSQL. Se corre solo.
@@ -88,7 +94,7 @@ test_db.py     — Script one-shot para verificar conectividad con la DB (no es 
 
 El flujo de ingesta (etapa 3): `POST /events` → validación Pydantic → `redis.lpush("events_queue")` → respuesta 202 → `worker.py` consume con `brpop` → deserializa JSON → reconstruye Event ORM → `db.commit()` → PostgreSQL.
 
-El flujo de métricas (etapa 4): `GET /metrics/summary` o `WS /ws/metrics` → `get_summary()` (SQL agregado) → PostgreSQL → JSON al cliente. El WebSocket lo empuja cada 3 s.
+El flujo de métricas (etapa 4): `GET /metrics/summary` o `WS /ws/metrics` → `get_summary()` (SQL agregado) → PostgreSQL → JSON al cliente → dashboard en /static/index.html. El WebSocket lo empuja cada 3 s.
 
 ## Roadmap del proyecto (Plataforma de analítica en tiempo real)
 
@@ -103,32 +109,31 @@ Etapas:
 2. [HECHO] Persistencia en PostgreSQL (SQLAlchemy + Alembic, code-first).
 3. [HECHO] Redis + workers: la API encola eventos en vez de escribir
    directo; los workers consumen la cola y guardan en PostgreSQL.
-4. [EN CURSO] Endpoints de métricas + dashboard en vivo por WebSocket.
-5. [PENDIENTE] Empaquetado con Docker y despliegue (Render/Railway/Fly.io).
+4. [HECHO] Endpoints de métricas + dashboard en vivo por WebSocket.
+5. [EN CURSO] Empaquetado con Docker y despliegue (Render/Railway/Fly.io).
 
-## Plan de la etapa 4 (EN CURSO) — métricas + dashboard en vivo
-Cuatro piezas, en este orden:
-- 4.1 [HECHO] app/metrics.py — get_summary() con SQL agregado.
-- 4.2 [HECHO] GET /metrics/summary en app/main.py — expone get_summary() por HTTP.
-      Endpoint `def` (síncrono): FastAPI lo manda a un threadpool y no bloquea el loop.
-- 4.3 [HECHO] WS /ws/metrics en app/main.py — WebSocket que empuja las métricas
-      cada 3 s. async def + await asyncio.to_thread(get_summary) + await asyncio.sleep(3).
-- 4.4 [PENDIENTE] Dashboard HTML en app/static/index.html — página que se conecta
-      al WebSocket y muestra las métricas actualizándose solas.
+## Plan de la etapa 5 (EN CURSO) — Docker y despliegue
+Objetivo: pasar de "corre en mi máquina" a un LINK EN VIVO en internet.
+Piezas previstas (a confirmar/ajustar cuando arranquemos):
+- 5.1 Dockerfile de la app (API + worker comparten imagen; se corren como
+      procesos/servicios distintos con el mismo código).
+- 5.2 docker-compose.yml para levantar TODO junto en local: api, worker,
+      postgres, redis. Reemplaza el arranque manual de cada servicio.
+      Ojo: dentro de compose, los hosts ya NO son localhost sino los nombres
+      de servicio (p. ej. DATABASE_URL apunta a "postgres", REDIS_HOST="redis").
+- 5.3 Ajustes para producción: variables de entorno en el proveedor (no .env),
+      aplicar migraciones en el arranque (alembic upgrade head), CORS si aplica.
+- 5.4 Despliegue en Render (u otro): crear los servicios (web = API, worker,
+      Postgres y Redis gestionados), conectar el repo, configurar variables,
+      obtener la URL pública. El dashboard ya usa wss:// automático por
+      derivar la URL de location, así que debería funcionar sin tocar el HTML.
 
-Concepto clave de la etapa (ya aplicado en 4.3):
-- Un endpoint WebSocket OBLIGA a `async def`: la conexión queda abierta mucho
-  tiempo; el event loop sostiene miles de conexiones sin un thread por cada una.
-- PERO SQLAlchemy es síncrono/bloqueante. Llamarlo directo dentro de un async def
-  bloquea el event loop y nadie más puede conectarse mientras corre la query.
-- Solución: `data = await asyncio.to_thread(get_summary)` → manda la query a un
-  thread del SO y deja el event loop libre. Puente sync↔async.
-- OJO con sleep: dentro de async se usa `await asyncio.sleep(3)` (NO time.sleep),
-  porque cede el control al event loop en vez de congelar todo.
-- Frase de entrevista: "El WebSocket requiere async por las conexiones de larga
-  duración; como SQLAlchemy es síncrono, usé asyncio.to_thread para correr las
-  queries en un thread sin bloquear el event loop, y así soportar miles de
-  clientes en el dashboard a la vez."
+Conceptos nuevos de esta etapa (explicar antes de escribir):
+- Imagen vs contenedor; Dockerfile (receta) vs docker-compose (orquesta varios).
+- Capas de la imagen y caché (orden de COPY/RUN para builds rápidos).
+- Redes de docker-compose: los servicios se hablan por nombre de servicio.
+- Volúmenes para que los datos de Postgres persistan.
+- Diferencia entre el entorno local (WSL/Windows) y el de producción.
 
 Decisiones de diseño ya tomadas (y su porqué):
 - Code-first con ORM y migraciones: el esquema vive en código y en git,
@@ -156,35 +161,30 @@ Decisiones de diseño ya tomadas (y su porqué):
   Depends(get_db), para ser reutilizable fuera del contexto HTTP.
 - WebSocket usa asyncio.to_thread para no bloquear el event loop con la query
   síncrona, y asyncio.sleep (no time.sleep) para la espera entre envíos.
+- Dashboard: HTML/CSS/JS puro, cero dependencias externas (mantiene el mensaje
+  "esto es backend"). La URL del WS se deriva de location.host para servir en
+  local y en producción sin cambios. Barras construidas con createElement +
+  textContent (no innerHTML) para evitar XSS. Auto-reconexión si cae el server.
 - Configuración por variables de entorno; secretos en .env (en .gitignore).
   redis_host/redis_port llevan defaults (localhost/6379) por ser estándar;
   database_url NO lleva default a propósito (es secreto y debe fallar si falta).
 
 ## Estado actual (retomar aquí)
-Etapa 4 casi lista. Hechas las piezas 4.1, 4.2 y 4.3:
-- app/metrics.py: get_summary() probado, devuelve {total_events, unique_users,
-  events_by_type}.
-- GET /metrics/summary: probado en /docs, devuelve el JSON de métricas.
-- WS /ws/metrics: probado desde la consola del navegador (DevTools → Console)
-  con:
-    const ws = new WebSocket("ws://localhost:8000/ws/metrics");
-    ws.onmessage = (e) => console.log(JSON.parse(e.data));
-  Llegan los datos cada 3 segundos. Funciona.
-- Limpieza hecha en main.py: se quitaron los imports huérfanos
-  (from app.database import get_db; from app.models import Event).
+ETAPA 4 COMPLETA. El sistema funciona de punta a punta y con dashboard pulido:
+- POST /events → Redis → worker.py → PostgreSQL → get_summary() → WebSocket →
+  dashboard en /static/index.html actualizándose en vivo.
+- Dashboard rediseñado (tema oscuro tipo consola de telemetría, tarjetas,
+  barras por tipo, indicador de conexión, auto-reconexión, wss:// automático).
+- Todo probado con eventos reales; los números y barras se actualizan solos.
 
-PENDIENTE — pieza 4.4 (retomar aquí mañana): el dashboard HTML.
-- Crear app/static/index.html: una página que se conecta a ws://.../ws/metrics
-  por JavaScript y muestra las métricas actualizándose solas
-  (document.getElementById(...).textContent = ...).
-- Servir archivos estáticos en main.py:
-    from fastapi.staticfiles import StaticFiles
-    app.mount("/static", StaticFiles(directory="app/static"), name="static")
-  Luego el dashboard queda en http://localhost:8000/static/index.html
-- Conceptos nuevos de esta pieza: (a) StaticFiles para servir HTML (FastAPI no
-  sirve HTML por defecto); (b) el mismo WebSocket de la prueba de consola, pero
-  dentro del HTML, actualizando el DOM cuando llega cada mensaje.
-- Con esto se cierra la ETAPA 4 completa.
+SIGUIENTE — ETAPA 5 (retomar aquí): Docker y despliegue. Ver "Plan de la etapa 5".
+Empezar por el concepto de Docker (imagen vs contenedor) antes de escribir el
+Dockerfile. Luego docker-compose para levantar api+worker+postgres+redis juntos,
+y finalmente el despliegue en Render para obtener la URL pública.
+
+Tareas de portafolio pendientes (además del despliegue):
+- README con GIF del dashboard en vivo, descripción, arquitectura y cómo correrlo.
+- Documento de "decisiones de diseño y su porqué" (guion de defensa para entrevista).
 
 ## Limpieza pendiente
 - El proyecto quedó anidado (analytics-realtime/analytics-realtime). Trabajar
