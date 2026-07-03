@@ -2,24 +2,323 @@
 <html lang="es">
 <head>
   <meta charset="UTF-8" />
-  <title>Dashboard Analytics</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>analytics · live</title>
+  <style>
+    :root {
+      --bg: #0e1216;
+      --surface: #151b21;
+      --line: #232c35;
+      --text: #e8edf2;
+      --muted: #6e7b8a;
+      --signal: #45d9a0;
+      --amber: #e3b341;
+      --danger: #e5636b;
+      --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, Roboto, sans-serif;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      min-height: 100vh;
+      line-height: 1.4;
+      -webkit-font-smoothing: antialiased;
+      background-image: radial-gradient(120% 60% at 50% -10%, rgba(69, 217, 160, 0.06), transparent 60%);
+    }
+
+    .shell {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 2.75rem 1.5rem 3rem;
+    }
+
+    /* Header */
+    .head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 1rem;
+      padding-bottom: 1.25rem;
+      border-bottom: 1px solid var(--line);
+    }
+    .brand { display: flex; flex-direction: column; gap: 0.3rem; }
+    .wordmark {
+      font-family: var(--mono);
+      font-size: 0.95rem;
+      font-weight: 500;
+      letter-spacing: 0.02em;
+    }
+    .wordmark::before { content: "▮ "; color: var(--signal); }
+    .tagline { font-size: 0.72rem; color: var(--muted); letter-spacing: 0.02em; }
+
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-family: var(--mono);
+      font-size: 0.7rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      padding: 0.3rem 0.6rem 0.3rem 0.55rem;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      white-space: nowrap;
+    }
+    .dot { width: 7px; height: 7px; border-radius: 50%; position: relative; background: var(--muted); }
+    .dot::after {
+      content: ""; position: absolute; inset: -4px; border-radius: 50%;
+      border: 1px solid currentColor; opacity: 0; color: inherit;
+    }
+    .status[data-state="live"]    { color: var(--signal); }
+    .status[data-state="live"] .dot { background: var(--signal); }
+    .status[data-state="live"] .dot::after { animation: ping 1.8s ease-out infinite; color: var(--signal); }
+    .status[data-state="connecting"] { color: var(--amber); }
+    .status[data-state="connecting"] .dot { background: var(--amber); }
+    .status[data-state="offline"] { color: var(--danger); }
+    .status[data-state="offline"] .dot { background: var(--danger); }
+
+    @keyframes ping {
+      0%   { opacity: 0.7; transform: scale(0.8); }
+      70%  { opacity: 0;   transform: scale(2.2); }
+      100% { opacity: 0;   transform: scale(2.2); }
+    }
+
+    /* Stat cards */
+    .stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      margin-top: 1.5rem;
+    }
+    .stat {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 1.4rem 1.5rem 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.7rem;
+    }
+    .label {
+      font-size: 0.68rem;
+      font-weight: 600;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .value {
+      font-family: var(--mono);
+      font-size: clamp(2.4rem, 9vw, 3.4rem);
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      font-variant-numeric: tabular-nums;
+      line-height: 1;
+    }
+    .flash { animation: flash 0.7s ease-out; }
+    @keyframes flash { 0% { color: var(--signal); } 100% { color: var(--text); } }
+
+    /* By-type panel */
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 1.4rem 1.5rem 1.5rem;
+      margin-top: 1rem;
+    }
+    .panel-head { margin-bottom: 1.15rem; }
+    .bars { display: flex; flex-direction: column; gap: 0.8rem; }
+    .bar-row {
+      display: grid;
+      grid-template-columns: minmax(4rem, 7rem) 1fr auto;
+      align-items: center;
+      gap: 0.9rem;
+    }
+    .bar-name {
+      font-family: var(--mono);
+      font-size: 0.82rem;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .bar-track {
+      height: 8px;
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .bar-fill {
+      display: block;
+      height: 100%;
+      width: 0;
+      border-radius: 999px;
+      background: linear-gradient(90deg, rgba(69, 217, 160, 0.55), var(--signal));
+      transition: width 0.6s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .bar-count {
+      font-family: var(--mono);
+      font-size: 0.82rem;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+      text-align: right;
+      min-width: 2.5ch;
+    }
+    .empty { color: var(--muted); font-size: 0.85rem; font-family: var(--mono); }
+    .empty[hidden] { display: none; }
+
+    /* Footer */
+    .foot {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      margin-top: 1.5rem;
+      padding-top: 1.1rem;
+      border-top: 1px solid var(--line);
+      font-family: var(--mono);
+      font-size: 0.7rem;
+      color: var(--muted);
+    }
+    .sep { opacity: 0.5; }
+
+    @media (max-width: 520px) {
+      .shell { padding: 2rem 1.1rem 2.5rem; }
+      .stats { grid-template-columns: 1fr; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::after { animation: none !important; transition: none !important; }
+    }
+  </style>
 </head>
 <body>
-  <h1>Métricas en vivo</h1>
+  <main class="shell">
+    <header class="head">
+      <div class="brand">
+        <span class="wordmark">analytics</span>
+        <span class="tagline">real-time event stream</span>
+      </div>
+      <div class="status" id="status" data-state="connecting">
+        <span class="dot"></span>
+        <span id="status-label">connecting</span>
+      </div>
+    </header>
 
-  <p>Total de eventos: <strong id="total"></strong></p>
-  <p>Usuarios únicos: <strong id="users"></strong></p>
-  <p>Eventos por tipo: <strong id="by-type"></strong></p>
+    <section class="stats">
+      <div class="stat">
+        <span class="label">Total events</span>
+        <span class="value" id="total">—</span>
+      </div>
+      <div class="stat">
+        <span class="label">Unique users</span>
+        <span class="value" id="users">—</span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><span class="label">Events by type</span></div>
+      <div class="bars" id="bars"></div>
+      <p class="empty" id="bars-empty">Waiting for events…</p>
+    </section>
+
+    <footer class="foot">
+      <span id="updated">Not yet updated</span>
+      <span class="sep">·</span>
+      <span>streaming every 3s</span>
+    </footer>
+  </main>
 
   <script>
-    const ws = new WebSocket("ws://localhost:8000/ws/metrics");
+    // Build the WebSocket URL from the current page, so it works both
+    // locally (ws://localhost:8000) and when deployed over HTTPS (wss://).
+    const wsUrl = `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws/metrics`;
 
-    ws.onmessage = function(e) {
-      const data = JSON.parse(e.data);
-      document.getElementById("total").textContent = data.total_events;
-      document.getElementById("users").textContent = data.unique_users;
-      document.getElementById("by-type").textContent = JSON.stringify(data.events_by_type);
-    };
+    const statusEl = document.getElementById("status");
+    const statusLabel = document.getElementById("status-label");
+    const barsEl = document.getElementById("bars");
+    const barsEmpty = document.getElementById("bars-empty");
+    const rows = new Map(); // event_name -> { row, fill, count }
+
+    function setStatus(state, label) {
+      statusEl.dataset.state = state;
+      statusLabel.textContent = label;
+    }
+
+    function setNumber(id, value) {
+      const el = document.getElementById(id);
+      const formatted = Number(value).toLocaleString();
+      if (el.textContent !== "—" && el.textContent !== formatted) {
+        el.classList.remove("flash");
+        void el.offsetWidth; // restart the animation
+        el.classList.add("flash");
+      }
+      el.textContent = formatted;
+    }
+
+    function renderBars(raw) {
+      // The API may send an object {name: count} or a list [[name, count]].
+      const entries = Array.isArray(raw) ? raw.slice() : Object.entries(raw || {});
+      entries.sort((a, b) => b[1] - a[1]);
+
+      barsEmpty.hidden = entries.length > 0;
+      const max = entries.length ? entries[0][1] : 1;
+      const seen = new Set();
+
+      for (const [name, count] of entries) {
+        seen.add(name);
+        let entry = rows.get(name);
+        if (!entry) {
+          const row = document.createElement("div");
+          row.className = "bar-row";
+          const nameEl = document.createElement("span");
+          nameEl.className = "bar-name";
+          nameEl.textContent = name; // textContent = safe against injected markup
+          const track = document.createElement("span");
+          track.className = "bar-track";
+          const fill = document.createElement("span");
+          fill.className = "bar-fill";
+          track.appendChild(fill);
+          const countEl = document.createElement("span");
+          countEl.className = "bar-count";
+          row.append(nameEl, track, countEl);
+          entry = { row, fill, count: countEl };
+          rows.set(name, entry);
+        }
+        entry.fill.style.width = (count / max * 100).toFixed(1) + "%";
+        entry.count.textContent = Number(count).toLocaleString();
+        barsEl.appendChild(entry.row); // re-append keeps rows sorted by count
+      }
+
+      // Drop bars for event types that are no longer present.
+      for (const [name, entry] of rows) {
+        if (!seen.has(name)) { entry.row.remove(); rows.delete(name); }
+      }
+    }
+
+    function render(data) {
+      setNumber("total", data.total_events);
+      setNumber("users", data.unique_users);
+      renderBars(data.events_by_type);
+      document.getElementById("updated").textContent =
+        "updated " + new Date().toLocaleTimeString();
+    }
+
+    function connect() {
+      setStatus("connecting", "connecting");
+      const ws = new WebSocket(wsUrl);
+      ws.onopen = () => setStatus("live", "live");
+      ws.onmessage = (e) => render(JSON.parse(e.data));
+      ws.onerror = () => ws.close();
+      ws.onclose = () => {
+        setStatus("offline", "reconnecting");
+        setTimeout(connect, 2000); // auto-recover if the server restarts
+      };
+    }
+
+    connect();
   </script>
 </body>
-</html> 
+</html>
