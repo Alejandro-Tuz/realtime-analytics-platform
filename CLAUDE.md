@@ -24,14 +24,13 @@ Reglas de interacción:
 
 ### Con Docker (forma actual — levanta TODO junto)
 ```
-docker compose up --build     # construye (si hace falta) y levanta api + worker + postgres + redis
+docker compose up --build     # construye y levanta api + worker + postgres + redis
 docker compose up             # levanta sin reconstruir
 docker compose down           # detiene y elimina los contenedores (CONSERVA los datos)
 docker compose down -v        # detiene y BORRA también el volumen de datos (¡cuidado!)
 docker compose logs -f api    # ver logs de un servicio (api, worker, postgres, redis)
 ```
-Con Docker NO hace falta arrancar nada a mano (ni Redis en WSL, ni uvicorn, ni el worker):
-`docker compose up` reemplaza todo ese arranque manual. Docker corre en WSL; si no está
+Con Docker NO hace falta arrancar nada a mano. Docker corre en WSL; si no está
 arrancado: `sudo service docker start`.
 
 ### Sin Docker (forma manual antigua, por si se necesita)
@@ -44,17 +43,20 @@ alembic revision --autogenerate -m "msg"  # generar migración
 python test_db.py                         # probar conexión a la DB
 ```
 Servicios externos (modo manual): PostgreSQL (5432) y Redis (6379 en WSL,
-`sudo service redis-server start`).
+`sudo service redis-server start`). En este modo, REDIS_URL toma su valor por
+defecto (redis://localhost:6379) si no se define en el entorno.
 
 ## Arquitectura del código
 
 ```
 app/
-  config.py    — Lee DATABASE_URL, REDIS_HOST y REDIS_PORT desde .env vía pydantic-settings.
+  config.py    — Lee DATABASE_URL y REDIS_URL desde el entorno/.env vía pydantic-settings.
+                 REDIS_URL tiene default redis://localhost:6379 (funciona sin Docker).
   database.py  — Crea el engine SQLAlchemy, SessionLocal y la clase Base para los modelos.
   models.py    — Modelo ORM Event; define la tabla `events` con sus columnas e índices.
   schemas.py   — Schema Pydantic EventCreate; valida el body JSON que llega al endpoint.
-  queue.py     — Crea el cliente Redis vía get_redis(); redis-py maneja el pool interno.
+  queue.py     — Crea el cliente Redis vía get_redis() usando redis.Redis.from_url(REDIS_URL);
+                 redis-py maneja el pool interno.
   metrics.py   — Consultas SQL agregadas con el ORM. get_summary(): total de eventos,
                  usuarios únicos (distinct) y conteo por tipo (group by + order by).
   main.py      — App FastAPI. Endpoints: GET /health, POST /events (encola en Redis, 202),
@@ -66,12 +68,13 @@ app/
 
 worker.py        — Proceso aparte. Consume events_queue con brpop, deserializa el JSON,
                    reconstruye el Event ORM y lo guarda en PostgreSQL.
-Dockerfile       — Imagen de la app (python:3.11-slim). Orden optimizado para caché de capas
-                   (COPY requirements → install → COPY resto). CMD ["./entrypoint.sh"].
-.dockerignore    — Excluye venv/, __pycache__, .env, .git de la imagen (más liviana y segura).
+Dockerfile       — Imagen de la app (python:3.11-slim). Orden optimizado para caché de capas.
+                   CMD ["./entrypoint.sh"].
+.dockerignore    — Excluye venv/, __pycache__, .env, .git de la imagen.
 entrypoint.sh    — Corre `alembic upgrade head` y luego `exec uvicorn ...`. Lo usa la API.
-docker-compose.yml — Orquesta 4 servicios: api, worker (misma imagen, command distinto),
-                   postgres (con volumen postgres_data) y redis. Red interna por nombre.
+docker-compose.yml — Orquesta api, worker (misma imagen, command distinto), postgres
+                   (con volumen postgres_data) y redis. Pasa DATABASE_URL y
+                   REDIS_URL=redis://redis:6379 (el host es el nombre del servicio).
 alembic/
   env.py         — Usa settings.database_url y detecta Base.metadata.
   versions/      — Migraciones versionadas; la primera crea la tabla events con sus índices.
@@ -97,69 +100,77 @@ Etapas:
 5. [EN CURSO] Docker y despliegue.
 
 ## Plan de la etapa 5 (EN CURSO) — Docker y despliegue
-- 5.1 [HECHO] Dockerfile + .dockerignore. Imagen construida; caché de capas verificado
-      (build de ~50s → ~2s; contexto 66MB → 1.5KB al ignorar venv/).
-- 5.2 [HECHO] docker-compose.yml: api + worker + postgres + redis con un solo comando.
-      Los servicios se hablan por NOMBRE (DATABASE_URL→postgres, REDIS_HOST→redis), no
-      localhost. Volumen postgres_data para persistir. depends_on para el orden de arranque.
-- 5.3 [HECHO] entrypoint.sh: corre `alembic upgrade head` antes de uvicorn, para crear el
-      esquema en cualquier entorno nuevo. Usa CMD (no ENTRYPOINT) para que el worker pueda
-      sobreescribir con `command: python worker.py`. #!/bin/sh (la slim no trae bash) y
-      `exec uvicorn` para que reciba bien las señales de apagado.
-- 5.4 [PENDIENTE] Despliegue en Render:
-      * Web Service (API, desde el Dockerfile) + Background Worker (python worker.py) +
-        PostgreSQL gestionado + Redis gestionado (servicios administrados por Render, no
-        contenedores propios).
-      * Conectar todo por variables de entorno (DATABASE_URL, REDIS_HOST/PORT) en Render.
-      * Revisar CORS (pendiente que dejó Claude Code) si el dashboard lo necesita.
+- 5.1 [HECHO] Dockerfile + .dockerignore. Caché de capas verificado (build ~50s → ~2s).
+- 5.2 [HECHO] docker-compose.yml: api + worker + postgres + redis con un comando.
+      Los servicios se hablan por NOMBRE (DATABASE_URL→postgres, REDIS_URL→redis://redis:6379),
+      no localhost. Volumen postgres_data para persistir. depends_on para el orden.
+- 5.3 [HECHO] entrypoint.sh: corre `alembic upgrade head` antes de uvicorn. Usa CMD (no
+      ENTRYPOINT) para que el worker sobreescriba con `command: python worker.py`.
+      #!/bin/sh (la slim no trae bash) y `exec uvicorn` para recibir bien las señales.
+- 5.3b [HECHO] Refactor Redis a una sola URL: config.py y queue.py ahora usan REDIS_URL
+      (con redis.Redis.from_url), no REDIS_HOST/REDIS_PORT. Motivo: Render entrega el Redis
+      como URL combinada (redis://host:6379), no como campos separados. Queda consistente
+      con DATABASE_URL. default redis://localhost:6379 para correr sin Docker.
+      docker-compose.yml actualizado a REDIS_URL. Probado en local con docker compose up.
+- 5.4 [EN CURSO] Despliegue en Render:
+      * [HECHO] PostgreSQL administrado creado (Oregon, free). Su URL empieza con
+        postgresql:// (compatible con SQLAlchemy, no hay que reescribir el esquema).
+      * [HECHO] Redis/Key Value administrado creado (Oregon, free). Internal URL:
+        redis://red-d94nnavaqgkc73e5op50:6379 (external bloqueado = más seguro).
+        Persistence Off (Redis es cola de paso; el almacén real es PostgreSQL).
+      * [PENDIENTE] Crear el Web Service (API) desde el Dockerfile, con variables de
+        entorno DATABASE_URL (la Internal de Postgres) y REDIS_URL (la Internal del Redis).
+        MISMA región (Oregon) para que se comuniquen por red privada.
+      * [PENDIENTE] Crear el Background Worker (misma imagen, command: python worker.py).
+      * [PENDIENTE] CORS: revisar si hace falta (probablemente no, porque el dashboard se
+        sirve desde el mismo origen que la API). Confirmar cuando la API esté viva.
+      * [PENDIENTE] Probar la URL pública y actualizar CV/README con el link de la demo.
       * Nota: el plan free de Render "duerme" los servicios; la primera visita tarda unos
-        segundos en despertar (es normal, no es error).
-      * REQUISITO: el repo debe estar ACTUALIZADO en GitHub (Render se alimenta del repo).
+        segundos en despertar (normal, no es error).
 
-Errores resueltos en la etapa 5 (para defender en entrevista):
+Errores/decisiones de la etapa 5 (para defender en entrevista):
 - ENTRYPOINT vs CMD: con ENTRYPOINT el `command:` del compose se vuelve ARGUMENTO (no
-  reemplaza), así que el worker corría uvicorn. Se volvió a CMD y el worker ya sobreescribe bien.
+  reemplaza), así que el worker corría uvicorn. Se volvió a CMD.
 - Race condition en migraciones: API y worker corrían alembic a la vez y chocaban al crear
-  alembic_version (duplicate key). Con CMD, solo la API migra; el worker ya no compite.
-- Puertos: DBeaver se conecta al 5433 (mapeado) que Docker reenvía al 5432 interno de postgres.
-- YAML: indentación es sintaxis (como Python); un bloque mal sangrado rompía el compose.
+  alembic_version (duplicate key). Con CMD, solo la API migra; el worker no compite.
+- Puertos: DBeaver se conecta al 5433 (mapeado) que Docker reenvía al 5432 interno.
+- YAML: la indentación es sintaxis (como Python).
+- redis.Redis.from_url + decode_responses=False: devuelve bytes, que json.loads acepta;
+  mantiene el worker funcionando igual que antes.
 
 Decisiones de diseño ya tomadas (y su porqué):
 - Code-first con ORM y migraciones; esquema en git, reproducible con `alembic upgrade head`.
 - `properties` como JSONB: flexible por tipo de evento; campos fijos indexados.
 - SQLAlchemy SÍNCRONO a propósito; endpoints de DB en `def` para no bloquear el event loop.
-- get_redis() crea el cliente por llamada (redis-py maneja pool interno; no hace falta singleton).
+- get_redis() crea el cliente por llamada con from_url(REDIS_URL); redis-py maneja el pool.
 - POST /events responde 202 Accepted (ingesta asíncrona; persiste el worker).
 - Cola FIFO: lpush (izq) en la API, brpop (der) en el worker → el más viejo primero.
-- Worker usa brpop bloqueante (no rpop) + timeout=5 (atender Ctrl+C) + try/except
-  TimeoutError (condición de carrera del socket Windows→WSL).
-- Worker maneja la sesión a mano (SessionLocal + try/finally), sin Depends(get_db).
-- WebSocket usa asyncio.to_thread (no bloquear el loop con la query síncrona) y asyncio.sleep.
-- Dashboard sin dependencias; URL del WS derivada de location; barras con textContent (anti-XSS);
-  auto-reconexión.
-- Dockerfile ordenado para caché de capas; .dockerignore excluye el .env (secretos NUNCA en la
-  imagen). En producción los secretos se inyectan por variables de entorno, no horneados.
-- Config por variables de entorno; secretos en .env (en .gitignore). redis_host/redis_port con
-  defaults (estándar); database_url sin default a propósito (secreto, debe fallar si falta).
+- Worker usa brpop bloqueante (no rpop) + timeout=5 + try/except TimeoutError (race del
+  socket Windows→WSL). Maneja la sesión a mano (SessionLocal + try/finally).
+- WebSocket usa asyncio.to_thread (no bloquear el loop) y asyncio.sleep (no time.sleep).
+- Dashboard sin dependencias; URL del WS derivada de location; barras con textContent
+  (anti-XSS); auto-reconexión.
+- Dockerfile ordenado para caché de capas; .dockerignore excluye el .env (secretos NUNCA
+  en la imagen; en producción se inyectan por variables de entorno).
+- Config por variables de entorno; secretos en .env (en .gitignore). REDIS_URL con default
+  (estándar); DATABASE_URL sin default a propósito (secreto, debe fallar si falta).
 
 ## Estado actual (retomar aquí)
-ETAPA 5 casi lista. Contenerización COMPLETA y probada:
-- `docker compose up --build` levanta api + worker + postgres + redis con un comando.
-- Migraciones automáticas al arrancar (entrypoint.sh); la tabla events se crea sola en la
-  base nueva del contenedor. /health y /metrics/summary responden dentro de Docker.
-- Datos persisten en el volumen postgres_data; DBeaver se conecta por el 5433.
-- Resueltos los líos de ENTRYPOINT/CMD y la race condition de migraciones.
+ETAPA 5 en la recta final. Contenerización COMPLETA y refactor de Redis a REDIS_URL HECHO
+y probado en local (docker compose up --build funciona: evento → cola → worker → Postgres).
+En Render ya están creados el PostgreSQL y el Redis (ambos en Oregon, free).
 
-PENDIENTE INMEDIATO:
-1. ACTUALIZAR GITHUB: ya se subió el repo antes, pero hay commits nuevos → hacer push para
-   ponerlo al día (Render lo necesita). Antes del push, confirmar con `git status --ignored`
-   que el .env sigue ignorado (NO subir la contraseña).
-2. Pieza 5.4: desplegar en Render (Web Service + Worker + Postgres + Redis gestionados),
-   variables de entorno, revisar CORS, obtener la URL pública.
-3. Al desplegar: agregar el link de la DEMO EN VIVO al CV (ya tiene el link del repo).
+PENDIENTE INMEDIATO (pieza 5.4, paso 2):
+1. Crear el Web Service (API) en Render desde el repo/Dockerfile:
+   - Variables de entorno: DATABASE_URL = (Internal URL del Postgres de Render),
+     REDIS_URL = redis://red-d94nnavaqgkc73e5op50:6379 (Internal del Redis).
+   - Misma región: Oregon.
+2. Crear el Background Worker (misma imagen, command: python worker.py, mismas variables).
+3. Revisar CORS si hace falta. Probar la URL pública.
+4. Agregar el link de la DEMO EN VIVO al CV y al README (el repo ya está enlazado).
 
 Tareas de portafolio pendientes (tras el despliegue):
-- README con GIF del dashboard en vivo, arquitectura, stack y cómo correrlo (docker compose up).
+- README con GIF del dashboard en vivo, arquitectura, stack y cómo correrlo.
 - Documento de "decisiones de diseño y su porqué" (guion de defensa para entrevista).
 
 ## Limpieza pendiente
