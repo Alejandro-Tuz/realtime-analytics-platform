@@ -22,46 +22,29 @@ Reglas de interacción:
 
 ## Comandos de desarrollo
 
-Activar el entorno virtual (Windows):
+### Con Docker (forma actual — levanta TODO junto)
 ```
-venv\Scripts\activate
+docker compose up --build     # construye (si hace falta) y levanta api + worker + postgres + redis
+docker compose up             # levanta sin reconstruir
+docker compose down           # detiene y elimina los contenedores (CONSERVA los datos)
+docker compose down -v        # detiene y BORRA también el volumen de datos (¡cuidado!)
+docker compose logs -f api    # ver logs de un servicio (api, worker, postgres, redis)
 ```
+Con Docker NO hace falta arrancar nada a mano (ni Redis en WSL, ni uvicorn, ni el worker):
+`docker compose up` reemplaza todo ese arranque manual. Docker corre en WSL; si no está
+arrancado: `sudo service docker start`.
 
-Levantar el servidor de desarrollo:
+### Sin Docker (forma manual antigua, por si se necesita)
 ```
-uvicorn app.main:app --reload
+venv\Scripts\activate                     # activar entorno (Windows)
+uvicorn app.main:app --reload             # API
+python worker.py                          # worker (otra terminal)
+alembic upgrade head                      # aplicar migraciones
+alembic revision --autogenerate -m "msg"  # generar migración
+python test_db.py                         # probar conexión a la DB
 ```
-
-Levantar el worker (en otra terminal, con el venv activo y Redis corriendo):
-```
-python worker.py
-```
-
-Verificar la conexión a la base de datos:
-```
-python test_db.py
-```
-
-Migraciones con Alembic:
-```
-alembic upgrade head                              # aplicar todas las migraciones pendientes
-alembic revision --autogenerate -m "descripcion" # generar migración desde los modelos
-alembic downgrade -1                              # revertir la última migración
-alembic history                                   # ver historial de migraciones
-
-```
-
-Instalar dependencias:
-```
-pip install -r requirements.txt
-```
-
-```
-Servicios externos que deben estar corriendo:
-- PostgreSQL (base `analytics`, puerto 5432).
-- Redis (puerto 6379) — corriendo en WSL (Ubuntu). Arrancar con
-  `sudo service redis-server start`; verificar con `redis-cli ping` → PONG.
-```
+Servicios externos (modo manual): PostgreSQL (5432) y Redis (6379 en WSL,
+`sudo service redis-server start`).
 
 ## Arquitectura del código
 
@@ -78,112 +61,105 @@ app/
                  GET /metrics/summary (métricas), WS /ws/metrics (métricas en vivo).
                  Monta StaticFiles en /static para servir el dashboard.
   static/
-    index.html — Dashboard en vivo (HTML/CSS/JS puro, sin frameworks). Se conecta al
-                 WebSocket, muestra total/usuarios únicos/eventos por tipo con barras,
-                 destella los números al cambiar, indicador de conexión y auto-reconexión.
-                 La URL del WS se deriva de location.host (sirve en local y en prod).
+    index.html — Dashboard en vivo (HTML/CSS/JS puro, sin frameworks). WebSocket, barras,
+                 destello al cambiar, indicador de conexión, auto-reconexión, wss:// automático.
 
-worker.py      — Proceso aparte (NO es la API). Consume events_queue con brpop, deserializa
-                 el JSON, reconstruye el Event ORM y lo guarda en PostgreSQL. Se corre solo.
+worker.py        — Proceso aparte. Consume events_queue con brpop, deserializa el JSON,
+                   reconstruye el Event ORM y lo guarda en PostgreSQL.
+Dockerfile       — Imagen de la app (python:3.11-slim). Orden optimizado para caché de capas
+                   (COPY requirements → install → COPY resto). CMD ["./entrypoint.sh"].
+.dockerignore    — Excluye venv/, __pycache__, .env, .git de la imagen (más liviana y segura).
+entrypoint.sh    — Corre `alembic upgrade head` y luego `exec uvicorn ...`. Lo usa la API.
+docker-compose.yml — Orquesta 4 servicios: api, worker (misma imagen, command distinto),
+                   postgres (con volumen postgres_data) y redis. Red interna por nombre.
 alembic/
-  env.py       — Configura Alembic para usar settings.database_url y detectar Base.metadata.
-  versions/    — Migraciones versionadas; la primera crea la tabla events con sus índices.
-
-test_db.py     — Script one-shot para verificar conectividad con la DB (no es suite de tests).
+  env.py         — Usa settings.database_url y detecta Base.metadata.
+  versions/      — Migraciones versionadas; la primera crea la tabla events con sus índices.
+test_db.py       — Script one-shot para verificar conectividad con la DB.
 ```
 
-El flujo de ingesta (etapa 3): `POST /events` → validación Pydantic → `redis.lpush("events_queue")` → respuesta 202 → `worker.py` consume con `brpop` → deserializa JSON → reconstruye Event ORM → `db.commit()` → PostgreSQL.
-
-El flujo de métricas (etapa 4): `GET /metrics/summary` o `WS /ws/metrics` → `get_summary()` (SQL agregado) → PostgreSQL → JSON al cliente → dashboard en /static/index.html. El WebSocket lo empuja cada 3 s.
+Flujo de ingesta: POST /events → Pydantic → redis.lpush("events_queue") → 202 →
+worker (brpop) → deserializa → Event ORM → db.commit() → PostgreSQL.
+Flujo de métricas: GET /metrics/summary o WS /ws/metrics → get_summary() → PostgreSQL →
+JSON → dashboard en /static/index.html (el WS empuja cada 3 s).
 
 ## Roadmap del proyecto (Plataforma de analítica en tiempo real)
 
-Mini-versión de Mixpanel/Google Analytics. Objetivo: ingesta de eventos a
-gran escala con procesamiento asíncrono y métricas en vivo.
-
-Arquitectura objetivo:
-Cliente → API (FastAPI) → Cola (Redis) → Workers → PostgreSQL → Dashboard (WebSocket)
+Mini-versión de Mixpanel/Google Analytics. Ingesta de eventos a gran escala con
+procesamiento asíncrono y métricas en vivo.
+Arquitectura: Cliente → API (FastAPI) → Cola (Redis) → Workers → PostgreSQL → Dashboard (WebSocket)
 
 Etapas:
 1. [HECHO] API recibe y valida eventos (FastAPI + Pydantic).
 2. [HECHO] Persistencia en PostgreSQL (SQLAlchemy + Alembic, code-first).
-3. [HECHO] Redis + workers: la API encola eventos en vez de escribir
-   directo; los workers consumen la cola y guardan en PostgreSQL.
-4. [HECHO] Endpoints de métricas + dashboard en vivo por WebSocket.
-5. [EN CURSO] Empaquetado con Docker y despliegue (Render/Railway/Fly.io).
+3. [HECHO] Redis + workers (ingesta asíncrona con cola).
+4. [HECHO] Métricas + dashboard en vivo por WebSocket.
+5. [EN CURSO] Docker y despliegue.
 
 ## Plan de la etapa 5 (EN CURSO) — Docker y despliegue
-Objetivo: pasar de "corre en mi máquina" a un LINK EN VIVO en internet.
-Piezas previstas (a confirmar/ajustar cuando arranquemos):
-- 5.1 Dockerfile de la app (API + worker comparten imagen; se corren como
-      procesos/servicios distintos con el mismo código).
-- 5.2 docker-compose.yml para levantar TODO junto en local: api, worker,
-      postgres, redis. Reemplaza el arranque manual de cada servicio.
-      Ojo: dentro de compose, los hosts ya NO son localhost sino los nombres
-      de servicio (p. ej. DATABASE_URL apunta a "postgres", REDIS_HOST="redis").
-- 5.3 Ajustes para producción: variables de entorno en el proveedor (no .env),
-      aplicar migraciones en el arranque (alembic upgrade head), CORS si aplica.
-- 5.4 Despliegue en Render (u otro): crear los servicios (web = API, worker,
-      Postgres y Redis gestionados), conectar el repo, configurar variables,
-      obtener la URL pública. El dashboard ya usa wss:// automático por
-      derivar la URL de location, así que debería funcionar sin tocar el HTML.
+- 5.1 [HECHO] Dockerfile + .dockerignore. Imagen construida; caché de capas verificado
+      (build de ~50s → ~2s; contexto 66MB → 1.5KB al ignorar venv/).
+- 5.2 [HECHO] docker-compose.yml: api + worker + postgres + redis con un solo comando.
+      Los servicios se hablan por NOMBRE (DATABASE_URL→postgres, REDIS_HOST→redis), no
+      localhost. Volumen postgres_data para persistir. depends_on para el orden de arranque.
+- 5.3 [HECHO] entrypoint.sh: corre `alembic upgrade head` antes de uvicorn, para crear el
+      esquema en cualquier entorno nuevo. Usa CMD (no ENTRYPOINT) para que el worker pueda
+      sobreescribir con `command: python worker.py`. #!/bin/sh (la slim no trae bash) y
+      `exec uvicorn` para que reciba bien las señales de apagado.
+- 5.4 [PENDIENTE] Despliegue en Render:
+      * Web Service (API, desde el Dockerfile) + Background Worker (python worker.py) +
+        PostgreSQL gestionado + Redis gestionado (servicios administrados por Render, no
+        contenedores propios).
+      * Conectar todo por variables de entorno (DATABASE_URL, REDIS_HOST/PORT) en Render.
+      * Revisar CORS (pendiente que dejó Claude Code) si el dashboard lo necesita.
+      * Nota: el plan free de Render "duerme" los servicios; la primera visita tarda unos
+        segundos en despertar (es normal, no es error).
+      * REQUISITO: el repo debe estar ACTUALIZADO en GitHub (Render se alimenta del repo).
 
-Conceptos nuevos de esta etapa (explicar antes de escribir):
-- Imagen vs contenedor; Dockerfile (receta) vs docker-compose (orquesta varios).
-- Capas de la imagen y caché (orden de COPY/RUN para builds rápidos).
-- Redes de docker-compose: los servicios se hablan por nombre de servicio.
-- Volúmenes para que los datos de Postgres persistan.
-- Diferencia entre el entorno local (WSL/Windows) y el de producción.
+Errores resueltos en la etapa 5 (para defender en entrevista):
+- ENTRYPOINT vs CMD: con ENTRYPOINT el `command:` del compose se vuelve ARGUMENTO (no
+  reemplaza), así que el worker corría uvicorn. Se volvió a CMD y el worker ya sobreescribe bien.
+- Race condition en migraciones: API y worker corrían alembic a la vez y chocaban al crear
+  alembic_version (duplicate key). Con CMD, solo la API migra; el worker ya no compite.
+- Puertos: DBeaver se conecta al 5433 (mapeado) que Docker reenvía al 5432 interno de postgres.
+- YAML: indentación es sintaxis (como Python); un bloque mal sangrado rompía el compose.
 
 Decisiones de diseño ya tomadas (y su porqué):
-- Code-first con ORM y migraciones: el esquema vive en código y en git,
-  reproducible con `alembic upgrade head`.
-- `properties` como JSONB: datos flexibles por tipo de evento; campos fijos
-  (event_name, user_id, timestamp) como columnas indexadas.
-- SQLAlchemy SÍNCRONO a propósito: los workers (síncronos) son los que
-  escriben; los endpoints HTTP de DB usan `def` para no bloquear el event loop.
-- Cliente Redis creado por llamada en get_redis(): redis-py maneja un pool
-  interno, así que no hace falta un singleton en este caso síncrono.
-- POST /events responde 202 Accepted: la ingesta es asíncrona; el evento se
-  acepta pero se procesa después (lo persiste el worker, no el endpoint).
-- Cola FIFO con Redis: el endpoint empuja con lpush (izquierda) y el worker
-  saca con brpop (derecha) → el evento más viejo se procesa primero.
-- Worker usa brpop (no rpop): bloquea/duerme cuando la cola está vacía en vez
-  de quemar CPU en espera activa. timeout=5 permite atender Ctrl+C limpiamente.
-- Worker maneja la sesión a mano (SessionLocal + try/finally) porque no hay
-  FastAPI que gestione el ciclo de vida con Depends(get_db).
-- Worker envuelve brpop en try/except redis.exceptions.TimeoutError: en el
-  puente de red Windows→WSL, el timeout del socket puede dispararse justo antes
-  de que Redis responda (condición de carrera). Se trata como "cola vacía"
-  (continue). Lección: en producción los workers SIEMPRE manejan errores de red.
-- worker.py va en la raíz (no en app/): es un proceso hermano, no parte de la API.
-- metrics.py usa SessionLocal + try/finally (igual que el worker), no
-  Depends(get_db), para ser reutilizable fuera del contexto HTTP.
-- WebSocket usa asyncio.to_thread para no bloquear el event loop con la query
-  síncrona, y asyncio.sleep (no time.sleep) para la espera entre envíos.
-- Dashboard: HTML/CSS/JS puro, cero dependencias externas (mantiene el mensaje
-  "esto es backend"). La URL del WS se deriva de location.host para servir en
-  local y en producción sin cambios. Barras construidas con createElement +
-  textContent (no innerHTML) para evitar XSS. Auto-reconexión si cae el server.
-- Configuración por variables de entorno; secretos en .env (en .gitignore).
-  redis_host/redis_port llevan defaults (localhost/6379) por ser estándar;
-  database_url NO lleva default a propósito (es secreto y debe fallar si falta).
+- Code-first con ORM y migraciones; esquema en git, reproducible con `alembic upgrade head`.
+- `properties` como JSONB: flexible por tipo de evento; campos fijos indexados.
+- SQLAlchemy SÍNCRONO a propósito; endpoints de DB en `def` para no bloquear el event loop.
+- get_redis() crea el cliente por llamada (redis-py maneja pool interno; no hace falta singleton).
+- POST /events responde 202 Accepted (ingesta asíncrona; persiste el worker).
+- Cola FIFO: lpush (izq) en la API, brpop (der) en el worker → el más viejo primero.
+- Worker usa brpop bloqueante (no rpop) + timeout=5 (atender Ctrl+C) + try/except
+  TimeoutError (condición de carrera del socket Windows→WSL).
+- Worker maneja la sesión a mano (SessionLocal + try/finally), sin Depends(get_db).
+- WebSocket usa asyncio.to_thread (no bloquear el loop con la query síncrona) y asyncio.sleep.
+- Dashboard sin dependencias; URL del WS derivada de location; barras con textContent (anti-XSS);
+  auto-reconexión.
+- Dockerfile ordenado para caché de capas; .dockerignore excluye el .env (secretos NUNCA en la
+  imagen). En producción los secretos se inyectan por variables de entorno, no horneados.
+- Config por variables de entorno; secretos en .env (en .gitignore). redis_host/redis_port con
+  defaults (estándar); database_url sin default a propósito (secreto, debe fallar si falta).
 
 ## Estado actual (retomar aquí)
-ETAPA 4 COMPLETA. El sistema funciona de punta a punta y con dashboard pulido:
-- POST /events → Redis → worker.py → PostgreSQL → get_summary() → WebSocket →
-  dashboard en /static/index.html actualizándose en vivo.
-- Dashboard rediseñado (tema oscuro tipo consola de telemetría, tarjetas,
-  barras por tipo, indicador de conexión, auto-reconexión, wss:// automático).
-- Todo probado con eventos reales; los números y barras se actualizan solos.
+ETAPA 5 casi lista. Contenerización COMPLETA y probada:
+- `docker compose up --build` levanta api + worker + postgres + redis con un comando.
+- Migraciones automáticas al arrancar (entrypoint.sh); la tabla events se crea sola en la
+  base nueva del contenedor. /health y /metrics/summary responden dentro de Docker.
+- Datos persisten en el volumen postgres_data; DBeaver se conecta por el 5433.
+- Resueltos los líos de ENTRYPOINT/CMD y la race condition de migraciones.
 
-SIGUIENTE — ETAPA 5 (retomar aquí): Docker y despliegue. Ver "Plan de la etapa 5".
-Empezar por el concepto de Docker (imagen vs contenedor) antes de escribir el
-Dockerfile. Luego docker-compose para levantar api+worker+postgres+redis juntos,
-y finalmente el despliegue en Render para obtener la URL pública.
+PENDIENTE INMEDIATO:
+1. ACTUALIZAR GITHUB: ya se subió el repo antes, pero hay commits nuevos → hacer push para
+   ponerlo al día (Render lo necesita). Antes del push, confirmar con `git status --ignored`
+   que el .env sigue ignorado (NO subir la contraseña).
+2. Pieza 5.4: desplegar en Render (Web Service + Worker + Postgres + Redis gestionados),
+   variables de entorno, revisar CORS, obtener la URL pública.
+3. Al desplegar: agregar el link de la DEMO EN VIVO al CV (ya tiene el link del repo).
 
-Tareas de portafolio pendientes (además del despliegue):
-- README con GIF del dashboard en vivo, descripción, arquitectura y cómo correrlo.
+Tareas de portafolio pendientes (tras el despliegue):
+- README con GIF del dashboard en vivo, arquitectura, stack y cómo correrlo (docker compose up).
 - Documento de "decisiones de diseño y su porqué" (guion de defensa para entrevista).
 
 ## Limpieza pendiente
