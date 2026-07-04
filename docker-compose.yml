@@ -20,8 +20,7 @@ services:
       - "8000:8000"
     environment:
       DATABASE_URL: postgresql://analytics_user:analytics_pass@postgres:5432/analytics
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
+      REDIS_URL: redis://redis:6379
     depends_on:
       - postgres
       - redis
@@ -31,8 +30,7 @@ services:
     command: python worker.py
     environment:
       DATABASE_URL: postgresql://analytics_user:analytics_pass@postgres:5432/analytics
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
+      REDIS_URL: redis://redis:6379
     depends_on:
       - postgres
       - redis
